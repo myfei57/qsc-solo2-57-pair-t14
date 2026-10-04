@@ -18,6 +18,9 @@ from .errors import ConfigError
 
 _MISSING = object()
 
+# 阀门阀位写盘失败时的两种按阀策略：原地重试或整条作废。
+VALVE_WRITE_POLICIES = ("retry", "abort")
+
 
 def _section(mapping: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     value = mapping.get(key)
@@ -196,16 +199,28 @@ class SecondaryLimits:
 
 @dataclass(frozen=True)
 class ValveLimits:
-    """阀门行程速率与到位公差。"""
+    """阀门行程速率、到位公差与写盘失败策略。
+
+    ``write_policy`` 按阀位定死：``"retry"`` 表示阀位写盘失败时这一条指令原地
+    挂起重试、队列不前进；``"abort"`` 表示整条指令作废，需要显式确认后检查点才
+    能越过它。
+    """
 
     travel_pct_s: float
     settle_band_pct: float
+    write_policy: str = "retry"
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "ValveLimits":
+        policy = str(section.get("write_policy", "retry"))
+        if policy not in VALVE_WRITE_POLICIES:
+            raise ConfigError(
+                f"阀门写盘失败策略必须是 {VALVE_WRITE_POLICIES} 之一", component="config"
+            )
         return cls(
             travel_pct_s=_number(section, "travel_pct_s", minimum=0.1),
             settle_band_pct=_number(section, "settle_band_pct", minimum=0.1),
+            write_policy=policy,
         )
 
     def settled(self, position_pct: float, target_pct: float) -> bool:
@@ -391,6 +406,7 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
             "valve": {
                 "travel_pct_s": cfg.valve.travel_pct_s,
                 "settle_band_pct": cfg.valve.settle_band_pct,
+                "write_policy": cfg.valve.write_policy,
             },
             "pump": {
                 "ramp_t_h_s": cfg.pump.ramp_t_h_s,

@@ -40,7 +40,8 @@
     },
     "valve": {
       "travel_pct_s": 12.0,
-      "settle_band_pct": 1.5
+      "settle_band_pct": 1.5,
+      "write_policy": "retry"
     },
     "pump": {
       "ramp_t_h_s": 40.0,

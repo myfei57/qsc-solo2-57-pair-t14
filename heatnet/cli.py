@@ -123,7 +123,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "settled": settled,
         "split": split,
         "queued": queued,
-        "replayed": {key: replayed[key] for key in ("ok", "replayed", "applied")},
+        "replayed": {key: replayed[key] for key in ("ok", "replayed", "retried", "fences", "applied")},
         "disturbance": disturbance,
         "concurrency": concurrency,
         "trip": {key: trip[key] for key in ("ok", "state", "reason", "trips")},

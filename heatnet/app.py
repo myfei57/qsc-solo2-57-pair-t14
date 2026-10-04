@@ -49,8 +49,9 @@ from .store.state import DurableState
 from .temp.curve import HeatCurve
 from .temp.forecast import build_forecast, describe_forecast
 from .telemetry import TrendBuffer
+from .valve.fence import ValveFence
 from .valve.move import load_valve
-from .valve.queue import ValveCommandQueue, replay_queue
+from .valve.queue import ValveCommandQueue, replay_queue, resolve_queue
 from .valve.valve import Valve
 
 DEFAULT_UNIT = "heatnet"
@@ -103,6 +104,7 @@ class Platform:
         self.mapping = StationMapping(self.zones)
 
         self.stations, self.valves, self.queues = self._build_stations()
+        self.fences = ValveFence()
         self.service = StationService(self.stations, self.valves, self.durable)
         self.pump: Pump = self._build_pump()
 
@@ -181,7 +183,7 @@ class Platform:
             self.namespaces.register("quota", f"{name}.heat-meter", "heat-meter")
 
     def _restore(self) -> None:
-        """从落盘状态恢复平台计数与阀门开度。"""
+        """从落盘状态恢复平台计数、阀门开度与失败围栏。"""
 
         state = self.store.read("platform_state")
         if isinstance(state, dict):
@@ -189,10 +191,11 @@ class Platform:
             self._cycles = int(state.get("cycles", 0))
         for name, valve in self.valves.items():
             load_valve(valve, self.durable)
-            applied = self.checkpoint.load(name)
-            for command in self.queues[name].commands():
-                if command.seq <= applied:
-                    continue
+            checkpoint_state = self.checkpoint.load_state(name)
+            self.fences.recover(name, checkpoint_state.blocked)
+            if checkpoint_state.blocked is not None:
+                blocked = checkpoint_state.blocked
+                self.queues[name].restore_command(blocked.seq, blocked.target_pct, blocked.source)
         try:
             records = self.audit.to_records(self.audit.replay_from_journal(limit=100_000))
         except PlantError:
@@ -525,7 +528,7 @@ class Platform:
             }
 
     def replay_valves(self, stations: list[str] | None = None) -> dict:
-        """按检查点回放阀门指令队列。"""
+        """按检查点回放阀门指令队列（挂起指令按各阀策略原地重试或等待裁决）。"""
 
         with self._lock:
             selected = list(stations) if stations else sorted(self.queues)
@@ -535,15 +538,37 @@ class Platform:
                     self.durable,
                     self.queues[name],
                     self.checkpoint,
+                    self.fences,
+                    self.bus,
+                    self.clock.now(),
                 )
                 for name in selected
             ]
             return {
-                "ok": True,
+                "ok": all(item["ok"] for item in reports),
                 "queues": reports,
                 "replayed": sum(item["replayed"] for item in reports),
+                "retried": sum(item["retried"] for item in reports),
+                "fences": self.fences.snapshot(),
                 "applied": {item["queue"]: item["applied"] for item in reports},
             }
+
+    def resolve_valve(self, station: str, decision: str) -> dict:
+        """裁决某只阀围栏上的挂起指令：retry 原地重试，abort 整条作废。"""
+
+        with self._lock:
+            if station not in self.queues:
+                raise KeyError(f"未登记换热站: {station}")
+            return resolve_queue(
+                self.valves[station],
+                self.durable,
+                self.queues[station],
+                self.checkpoint,
+                self.fences,
+                str(decision),
+                self.bus,
+                self.clock.now(),
+            )
 
     def queue_commands(
         self, station: str, targets: list[float], source: str = "dispatch"
@@ -800,12 +825,19 @@ class Platform:
                     "batches": self.service.batches(),
                     "aborted": self.service.aborted(),
                 },
+                "fences": self.fences.snapshot(),
                 "detail": {
                     name: {
                         **self.stations[name].snapshot().as_dict(),
                         "valve": self.valves[name].snapshot().as_dict(),
                         "queued": len(self.queues[name].commands()),
                         "applied": self.checkpoint.load(name),
+                        "fence": self.fences.state(name),
+                        "blocked": (
+                            None
+                            if self.fences.blocked(name) is None
+                            else self.fences.blocked(name).as_dict()
+                        ),
                     }
                     for name in sorted(self.stations)
                 },

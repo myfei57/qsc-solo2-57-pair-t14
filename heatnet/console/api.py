@@ -71,6 +71,7 @@ class Api:
         add("POST", "/api/settle", self._settle)
         add("POST", "/api/zone/split", self._split)
         add("POST", "/api/valve/replay", self._replay)
+        add("POST", "/api/valve/resolve", self._resolve_valve)
         add("POST", "/api/pump", self._pump)
         add("POST", "/api/disturb", self._disturb)
         add("POST", "/api/trip", self._trip)
@@ -152,9 +153,22 @@ class Api:
 
     def _valves(self, params: dict, body: dict) -> dict:
         names = self._platform.service.names()
+        fences = self._platform.fences
         return {
             "count": len(names),
-            "valves": [self._platform.service.valve(name).snapshot().as_dict() for name in names],
+            "fences": fences.snapshot(),
+            "valves": [
+                {
+                    **self._platform.service.valve(name).snapshot().as_dict(),
+                    "fence": fences.state(name),
+                    "blocked": (
+                        None
+                        if fences.blocked(name) is None
+                        else fences.blocked(name).as_dict()
+                    ),
+                }
+                for name in names
+            ],
         }
 
     def _curve(self, params: dict, body: dict) -> dict:
@@ -318,6 +332,12 @@ class Api:
         stations = body.get("stations")
         selected = None if not stations else [str(item) for item in stations]
         return self._platform.replay_valves(selected)
+
+    def _resolve_valve(self, params: dict, body: dict) -> dict:
+        decision = str(body.get("decision", ""))
+        if decision not in ("retry", "abort"):
+            raise PlantError("decision 必须是 retry 或 abort", component="console")
+        return self._platform.resolve_valve(str(body.get("station", "")), decision)
 
     def _pump(self, params: dict, body: dict) -> dict:
         action = str(body.get("action", "cycle"))

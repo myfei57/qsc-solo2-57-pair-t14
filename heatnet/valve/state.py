@@ -15,6 +15,7 @@ class ValveSnapshot:
     moves: int
     settled: bool
     rejected: int
+    write_policy: str = "retry"
 
     def as_dict(self) -> dict:
         return {
@@ -24,4 +25,5 @@ class ValveSnapshot:
             "moves": self.moves,
             "settled": self.settled,
             "rejected": self.rejected,
+            "write_policy": self.write_policy,
         }
