@@ -45,6 +45,7 @@ class Api:
         add("GET", "/api/stations", self._stations)
         add("GET", "/api/station/{name}", self._station)
         add("GET", "/api/valves", self._valves)
+        add("GET", "/api/fences", self._fences)
         add("GET", "/api/curve", self._curve)
         add("GET", "/api/forecast", self._forecast)
         add("GET", "/api/pressure", self._pressure)
@@ -71,6 +72,7 @@ class Api:
         add("POST", "/api/settle", self._settle)
         add("POST", "/api/zone/split", self._split)
         add("POST", "/api/valve/replay", self._replay)
+        add("POST", "/api/valve/fence", self._fence)
         add("POST", "/api/pump", self._pump)
         add("POST", "/api/disturb", self._disturb)
         add("POST", "/api/trip", self._trip)
@@ -156,6 +158,9 @@ class Api:
             "count": len(names),
             "valves": [self._platform.service.valve(name).snapshot().as_dict() for name in names],
         }
+
+    def _fences(self, params: dict, body: dict) -> dict:
+        return {"fences": self._platform.fence_report()}
 
     def _curve(self, params: dict, body: dict) -> dict:
         payload = self._platform.curve_report()
@@ -318,6 +323,13 @@ class Api:
         stations = body.get("stations")
         selected = None if not stations else [str(item) for item in stations]
         return self._platform.replay_valves(selected)
+
+    def _fence(self, params: dict, body: dict) -> dict:
+        station = str(body.get("station", ""))
+        action = str(body.get("action", "trip"))
+        if action == "arm":
+            return self._platform.arm_valve_fence(station, str(body.get("operator", "console")))
+        return self._platform.trip_valve_fence(station, str(body.get("reason", "console-trip")))
 
     def _pump(self, params: dict, body: dict) -> dict:
         action = str(body.get("action", "cycle"))

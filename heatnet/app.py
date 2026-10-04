@@ -49,8 +49,9 @@ from .store.state import DurableState
 from .temp.curve import HeatCurve
 from .temp.forecast import build_forecast, describe_forecast
 from .telemetry import TrendBuffer
+from .valve.fence import Fence, arm_fence, load_fence, trip_fence
 from .valve.move import load_valve
-from .valve.queue import ValveCommandQueue, replay_queue
+from .valve.queue import ValveCommandQueue, reconcile_queue, replay_queue
 from .valve.valve import Valve
 
 DEFAULT_UNIT = "heatnet"
@@ -102,7 +103,7 @@ class Platform:
         self._build_zones()
         self.mapping = StationMapping(self.zones)
 
-        self.stations, self.valves, self.queues = self._build_stations()
+        self.stations, self.valves, self.queues, self.fences = self._build_stations()
         self.service = StationService(self.stations, self.valves, self.durable)
         self.pump: Pump = self._build_pump()
 
@@ -129,19 +130,23 @@ class Platform:
             for station in stations:
                 self.zones.assign(station, name)
 
-    def _build_stations(self) -> tuple[dict[str, HeatStation], dict[str, Valve], dict[str, ValveCommandQueue]]:
-        """按分区表登记换热站、混水阀与各自的指令队列。"""
+    def _build_stations(
+        self,
+    ) -> tuple[dict[str, HeatStation], dict[str, Valve], dict[str, ValveCommandQueue], dict[str, Fence]]:
+        """按分区表登记换热站、混水阀、指令队列与围栏。"""
 
         stations: dict[str, HeatStation] = {}
         valves: dict[str, Valve] = {}
         queues: dict[str, ValveCommandQueue] = {}
+        fences: dict[str, Fence] = {}
         for zone in self.zones.names():
             for name in self.zones.stations(zone):
                 station = HeatStation(name, zone, self.config.station)
                 stations[name] = station
                 valves[name] = Valve(f"{name}.mix", self.config.valve)
                 queues[name] = ValveCommandQueue(name)
-        return stations, valves, queues
+                fences[name] = Fence(name)
+        return stations, valves, queues, fences
 
     def _build_pump(self) -> Pump:
         """按一次网基线构造循环泵特性。"""
@@ -181,18 +186,16 @@ class Platform:
             self.namespaces.register("quota", f"{name}.heat-meter", "heat-meter")
 
     def _restore(self) -> None:
-        """从落盘状态恢复平台计数与阀门开度。"""
+        """从落盘状态恢复平台计数、围栏、阀门开度，并做重启对账。"""
 
         state = self.store.read("platform_state")
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
         for name, valve in self.valves.items():
+            load_fence(self.fences[name], self.durable)
             load_valve(valve, self.durable)
-            applied = self.checkpoint.load(name)
-            for command in self.queues[name].commands():
-                if command.seq <= applied:
-                    continue
+            reconcile_queue(valve, self.queues[name], self.checkpoint, self.bus)
         try:
             records = self.audit.to_records(self.audit.replay_from_journal(limit=100_000))
         except PlantError:
@@ -535,15 +538,70 @@ class Platform:
                     self.durable,
                     self.queues[name],
                     self.checkpoint,
+                    fence=self.fences[name],
+                    bus=self.bus,
                 )
                 for name in selected
             ]
             return {
-                "ok": True,
+                "ok": all(item["stop"] is None for item in reports),
                 "queues": reports,
                 "replayed": sum(item["replayed"] for item in reports),
+                "held": sum(item["held"] for item in reports),
+                "blocked": sum(item["blocked"] for item in reports),
+                "voided": sum(item["voided"] for item in reports),
                 "applied": {item["queue"]: item["applied"] for item in reports},
             }
+
+    def trip_valve_fence(self, station: str, reason: str = "operator-trip") -> dict:
+        """触发某站阀门围栏：先落盘，再改内存，并落审计。"""
+
+        with self._lock:
+            fence = self.fences[station]
+            snapshot = trip_fence(fence, self.durable, reason)
+            self.bus.publish(
+                Event.of(
+                    "valve",
+                    f"valve.{station}",
+                    "fence_trip",
+                    asset=station,
+                    severity="alarm",
+                    message=f"阀门围栏触发：{reason}",
+                    fence=snapshot.as_dict(),
+                )
+            )
+            return {"ok": True, "station": station, "fence": snapshot.as_dict()}
+
+    def arm_valve_fence(self, station: str, operator: str = "shift-lead") -> dict:
+        """重新投用某站阀门围栏：先落盘，再改内存，并落审计。"""
+
+        with self._lock:
+            fence = self.fences[station]
+            snapshot = arm_fence(fence, self.durable, f"armed-by-{operator}")
+            self.bus.publish(
+                Event.of(
+                    "valve",
+                    f"valve.{station}",
+                    "fence_arm",
+                    asset=station,
+                    severity="notice",
+                    message=f"{operator} 重新投用阀门围栏",
+                    fence=snapshot.as_dict(),
+                )
+            )
+            return {"ok": True, "station": station, "fence": snapshot.as_dict()}
+
+    def fence_report(self) -> dict:
+        """汇总各站围栏状态，供控制台展示。"""
+
+        return {
+            name: {
+                **self.fences[name].snapshot().as_dict(),
+                "position_pct": round(self.valves[name].position_pct(), 2),
+                "applied": self.checkpoint.load(name),
+            }
+            for name in sorted(self.fences)
+        }
 
     def queue_commands(
         self, station: str, targets: list[float], source: str = "dispatch"
@@ -804,6 +862,7 @@ class Platform:
                     name: {
                         **self.stations[name].snapshot().as_dict(),
                         "valve": self.valves[name].snapshot().as_dict(),
+                        "fence": self.fences[name].snapshot().as_dict(),
                         "queued": len(self.queues[name].commands()),
                         "applied": self.checkpoint.load(name),
                     }
@@ -811,13 +870,13 @@ class Platform:
                 },
             },
             "zones": self.zones.describe(),
+            "fences": self.fence_report(),
             "mapping": self.mapping.describe(),
             "quota": self.quota_report(),
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
             "ids_issued": self.ids.issued(),
         }
-
     def snapshot(self) -> dict:
         """返回只读的整体快照（状态 + 拓扑 + 命名空间 + 分区 + 趋势）。"""
 
